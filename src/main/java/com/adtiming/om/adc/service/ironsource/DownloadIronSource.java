@@ -1,15 +1,17 @@
+// Copyright 2020 ADTIMING TECHNOLOGY COMPANY LIMITED
+// Licensed under the GNU Lesser General Public License Version 3
 package com.adtiming.om.adc.service.ironsource;
 
 import com.adtiming.om.adc.dto.ReportAdnData;
 import com.adtiming.om.adc.dto.ReportTask;
 import com.adtiming.om.adc.service.AdnBaseService;
 import com.adtiming.om.adc.service.AppConfig;
-import com.adtiming.om.adc.util.Base64;
 import com.adtiming.om.adc.util.MapHelper;
 import com.adtiming.om.adc.util.MyHttpClient;
 import com.adtiming.om.adc.util.Util;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
@@ -29,10 +31,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-/**
- * Created by huangqiang on 2020/1/6.
- * DownloadFacebookNew
- */
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 @Service
 public class DownloadIronSource extends AdnBaseService {
 
@@ -44,12 +44,13 @@ public class DownloadIronSource extends AdnBaseService {
     private AppConfig cfg;
 
     @Resource
-    private JdbcTemplate jdbcTemplateW;
+    private JdbcTemplate jdbcTemplate;
 
     @Override
     public void setAdnInfo() {
         this.adnId = 15;
         this.adnName = "ironSource";
+        this.maxTaskCount = 10;//IronSource is limited to 20 requests every 10 minutes.
     }
 
     @Override
@@ -71,27 +72,33 @@ public class DownloadIronSource extends AdnBaseService {
         }
         LOG.info("[IronSource] executeTaskImpl start, taskId:{}", task.id);
         long start = System.currentTimeMillis();
-        updateTaskStatus(jdbcTemplateW, task.id, 1, "");
+        updateTaskStatus(jdbcTemplate, task.id, 1, "");
         StringBuilder err = new StringBuilder();
         String error;
+        task.step = 1;
         String json_data = downJsonData(task.id, username, secretKey, day, err);
         if (StringUtils.isNotBlank(json_data) && err.length() == 0) {
+            task.step = 2;
             error = jsonDataImportDB(json_data, day, username);
             if (StringUtils.isBlank(error)) {
+                task.step = 3;
                 error = savePrepareReportData(task, username);
                 if (StringUtils.isBlank(error)) {
+                    task.step = 4;
                     error = reportLinkedToStat(task, username);
                 }
             }
         } else {
             error = err.toString();
         }
-        int status = StringUtils.isBlank(error) || "data is null".equals(error) ? 2 : 3;
-        if (task.runCount > 5 && status != 2) {
-            //updateAccountException(jdbcTemplateW, task.report_account_id, error);
+        int status = getStatus(error);
+        error = convertMsg(error);
+        if (task.runCount >= 4 && status != 2) {
+            updateAccountException(jdbcTemplate, task, error);
             LOG.error("[IronSource] executeTaskImpl error,run count:{},taskId:{},msg:{}", task.runCount + 1, task.id, error);
+        } else {
+            updateTaskStatus(jdbcTemplate, task.id, status, error);
         }
-        updateTaskStatus(jdbcTemplateW, task.id, status, error);
         LOG.info("[IronSource] executeTaskImpl end, taskId:{}, cost:{}", task.id,System.currentTimeMillis() - start);
     }
 
@@ -101,9 +108,9 @@ public class DownloadIronSource extends AdnBaseService {
         LOG.info("[IcronSource] downJsonData start, taskId:{}", taskId);
         long start = System.currentTimeMillis();
         try {
-            String token = Base64.encode(username + ":" + secretKey);
+            String token = Base64.encodeBase64String((username + ":" + secretKey).getBytes(UTF_8));
             String reportUrl = String.format(REPORT_URL, day, day);
-            updateReqUrl(jdbcTemplateW, taskId, reportUrl);
+            updateReqUrl(jdbcTemplate, taskId, reportUrl);
             HttpGet httpGet = new HttpGet(reportUrl);
             httpGet.setHeader("Authorization", "Basic " + token);
             httpGet.setHeader("Accept", "application/json; */*");
@@ -144,7 +151,7 @@ public class DownloadIronSource extends AdnBaseService {
         int dataCount = 0;
         try {
             String deleteSql = "DELETE FROM report_ironsource WHERE `date`=? AND username=? ";
-            jdbcTemplateW.update(deleteSql, day, username);
+            jdbcTemplate.update(deleteSql, day, username);
 
             String insertSql = "INSERT INTO report_ironsource (`date`, country_code, app_key, platform, ad_units, instance_id, instance_name, bundle_id, " +
                     "app_name, revenue, ecpm, impressions, active_users, engaged_users, engagement_rate, impressions_per_engaged_user, revenue_per_active_user, " +
@@ -184,14 +191,14 @@ public class DownloadIronSource extends AdnBaseService {
                         lsParm.add(params);
                         dataCount++;
                         if (lsParm.size() >= 1000) {
-                            jdbcTemplateW.batchUpdate(insertSql, lsParm);
+                            jdbcTemplate.batchUpdate(insertSql, lsParm);
                             lsParm.clear();
                         }
                     }
                 }
             }
             if (!lsParm.isEmpty()) {
-                jdbcTemplateW.batchUpdate(insertSql, lsParm);
+                jdbcTemplate.batchUpdate(insertSql, lsParm);
             }
         } catch (Exception e) {
             error = String.format("insert report_ironsource error, msg:%s", e.getMessage());
@@ -209,7 +216,7 @@ public class DownloadIronSource extends AdnBaseService {
             case 2:
                 typeStr = "Rewarded Video";
                 break;
-            case 4:
+            case 3:
                 typeStr = "Interstitial";
                 break;
         }
@@ -227,13 +234,11 @@ public class DownloadIronSource extends AdnBaseService {
                     " where `date` =? and username=? " +
                     " group by `date`,country_code,ad_units,instance_id";
 
-            List<ReportAdnData> oriDataList = jdbcTemplateW.query(dataSql, ReportAdnData.ROWMAPPER, task.day, username);
+            List<ReportAdnData> oriDataList = jdbcTemplate.query(dataSql, ReportAdnData.ROWMAPPER, task.day, username);
             if (oriDataList.isEmpty())
                 return "data is null";
 
-            String whereSql = String.format("b.client_id='%s'", username);
-            String changedWhereSql = String.format("(b.client_id='%s' or b.new_account_key='%s')", username, username);
-            List<Map<String, Object>> instanceInfoList = getInstanceList(whereSql, changedWhereSql);
+            List<Map<String, Object>> instanceInfoList = getInstanceList(task.reportAccountId);
             Map<String, Map<String, Object>> placements = instanceInfoList.stream()
                     .collect(Collectors.toMap(m ->
                                     String.format("%s_%s_%s", MapHelper.getString(m, "adn_app_key"), getAdTypeString(MapHelper.getInt(m, "ad_type")),
